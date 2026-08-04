@@ -6,27 +6,32 @@ import com.yourorg.mcpagent.domain.OrchestrationService;
 import com.yourorg.mcpagent.domain.OrchestrationService.DiscoveredTool;
 
 import org.junit.jupiter.api.Test;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
 import org.springframework.http.MediaType;
-import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
-@WebMvcTest(AgentController.class)
+/**
+ * Controller unit tests using MockMvc standalone setup.
+ *
+ * No Spring context is loaded — standaloneSetup wires only the controller with
+ * Jackson message converters. Spring Boot 4 removed @WebMvcTest; this approach
+ * is faster and avoids all Spring AI auto-configuration concerns.
+ */
 class AgentControllerTest {
 
-    @Autowired
-    MockMvc mockMvc;
+    private final OrchestrationService orchestrationService = mock(OrchestrationService.class);
 
-    @MockitoBean
-    OrchestrationService orchestrationService;
+    private final MockMvc mockMvc = MockMvcBuilders
+            .standaloneSetup(new AgentController(orchestrationService))
+            .build();
 
     // ── POST /api/agent/chat ─────────────────────────────────────────────
 
@@ -112,9 +117,9 @@ class AgentControllerTest {
     @Test
     void tools_returns200WithToolArray() throws Exception {
         when(orchestrationService.discoverTools()).thenReturn(List.of(
-                new DiscoveredTool("finance-mcp", "calculate_simple_interest", "Calculates SI"),
-                new DiscoveredTool("research-mcp", "search_learning_resources", "Finds resources"),
-                new DiscoveredTool("comms-mcp", "send_greeting", "Sends greeting")
+                new DiscoveredTool("finance-mcp",  "calculate_simple_interest",  "Calculates SI"),
+                new DiscoveredTool("research-mcp", "search_learning_resources",  "Finds resources"),
+                new DiscoveredTool("comms-mcp",    "send_greeting",              "Sends greeting")
         ));
 
         mockMvc.perform(get("/api/agent/tools"))

@@ -4,8 +4,8 @@ import java.util.List;
 
 import com.yourorg.mcpagent.domain.OrchestrationService;
 import com.yourorg.mcpagent.domain.OrchestrationService.DiscoveredTool;
-import io.karatelabs.karate.Results;
-import io.karatelabs.karate.Runner;
+import com.intuit.karate.Results;
+import com.intuit.karate.Runner;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
