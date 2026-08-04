@@ -1,5 +1,7 @@
 # MCP Agent Demo — Spring Boot 4.1 + Spring AI 2.0
 
+**GitHub:** https://github.com/milindbangar79/mcp-agent-demo
+
 An LLM-driven agent that discovers and orchestrates tools from **three domain-scoped
 MCP skill servers**, with a React 19 frontend. The agent uses a local Ollama model —
 no API key or cloud dependency.
