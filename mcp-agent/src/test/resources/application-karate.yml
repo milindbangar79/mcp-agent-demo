@@ -1,0 +1,16 @@
+# Test profile used by KarateApiTest.
+# Disables MCP client connections and Ollama — OrchestrationService is mocked.
+spring:
+  ai:
+    mcp:
+      client:
+        enabled: false
+    ollama:
+      base-url: http://localhost:11434
+      chat:
+        model: llama3.1:8b
+
+logging:
+  level:
+    root: WARN
+    com.yourorg.mcpagent: INFO
