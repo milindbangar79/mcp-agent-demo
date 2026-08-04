@@ -1,0 +1,27 @@
+# Defaults safe for all profiles. Per-profile overrides go in
+# application-<profile>.yml (local | dev | staging | prod). No secrets here — ever.
+spring:
+  application:
+    name: general-purpose-mcp
+  ai:
+    mcp:
+      server:
+        name: general-purpose-mcp
+        version: 0.1.0
+        protocol: STREAMABLE      # Streamable HTTP — SSE is deprecated in Spring AI 2.0
+        type: SYNC                # blocking tools; switch to ASYNC only for reactive workloads
+        annotation-scanner:
+          enabled: true           # auto-discover @McpTool beans
+        streamable-http:
+          mcp-endpoint: /mcp
+          keep-alive-interval: 30s
+
+server:
+  port: 8081
+
+logging:
+  level:
+    com.yourorg.generalpurposemcp: INFO
+    # Bump these to DEBUG locally when inspecting the MCP handshake:
+    org.springframework.ai: DEBUG
+    io.modelcontextprotocol: DEBUG

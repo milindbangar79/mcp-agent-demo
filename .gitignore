@@ -1,0 +1,35 @@
+# ── Maven ────────────────────────────────────────────────
+target/
+!.mvn/wrapper/maven-wrapper.jar
+!**/src/main/**/target/
+!**/src/test/**/target/
+
+# ── Node / npm ───────────────────────────────────────────
+node_modules/
+npm-debug.log*
+
+# ── TypeScript build cache ───────────────────────────────
+*.tsbuildinfo
+
+# ── IDE ──────────────────────────────────────────────────
+.idea/
+*.iml
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# ── OS ───────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Env / secrets ────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+
+# ── Logs ─────────────────────────────────────────────────
+*.log
+logs/

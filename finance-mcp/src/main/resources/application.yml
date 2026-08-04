@@ -1,0 +1,24 @@
+spring:
+  application:
+    name: finance-mcp
+  ai:
+    mcp:
+      server:
+        name: finance-mcp
+        version: 0.1.0
+        protocol: STREAMABLE
+        type: SYNC
+        annotation-scanner:
+          enabled: true
+        streamable-http:
+          mcp-endpoint: /mcp
+          keep-alive-interval: 30s
+
+server:
+  port: 8082
+
+logging:
+  level:
+    com.milind.financemcp: INFO
+    org.springframework.ai: DEBUG
+    io.modelcontextprotocol: DEBUG

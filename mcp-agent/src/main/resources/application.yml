@@ -1,0 +1,41 @@
+# Defaults safe for all profiles. No secrets — Ollama is local and keyless.
+spring:
+  application:
+    name: mcp-agent
+  ai:
+    mcp:
+      client:
+        enabled: true
+        name: mcp-agent
+        version: 0.1.0
+        type: SYNC
+        request-timeout: 60s          # local LLM tool loops can be slow; be generous
+        streamable-http:
+          connections:
+            finance-mcp:              # Finance Skill — calculate_simple_interest
+              url: http://localhost:8082
+              endpoint: /mcp
+            research-mcp:             # Research Skill — search_learning_resources
+              url: http://localhost:8083
+              endpoint: /mcp
+            comms-mcp:                # Communication Skill — send_greeting
+              url: http://localhost:8084
+              endpoint: /mcp
+    ollama:
+      base-url: http://localhost:11434
+      chat:
+        # Must be a tool-calling-capable model. qwen2.5 / llama3.1 / mistral all work.
+        # qwen2.5-coder emits tool calls as text, not as Ollama tool_calls API format.
+        model: llama3.1:8b
+        options:
+          temperature: 0.2            # low temp = more reliable tool selection
+
+server:
+  port: 8080
+
+logging:
+  level:
+    com.yourorg.mcpagent: INFO
+    # DEBUG below to watch discovery + the tool-calling loop:
+    org.springframework.ai: DEBUG
+    io.modelcontextprotocol: DEBUG
