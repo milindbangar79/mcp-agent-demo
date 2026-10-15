@@ -16,7 +16,7 @@
   <parent>
     <groupId>org.springframework.boot</groupId>
     <artifactId>spring-boot-starter-parent</artifactId>
-    <version>4.1.0</version>
+    <version>4.1.1</version>
     <relativePath/> <!-- lookup parent from repository -->
   </parent>
 
@@ -30,7 +30,7 @@
     <java.version>21</java.version>
     <!-- Spring AI is NOT pinned by the internal parent (yet), so the BOM import
          below is legitimate. If the parent later pins Spring AI, remove this. -->
-    <spring-ai.version>2.0.0</spring-ai.version>
+    <spring-ai.version>2.0.1</spring-ai.version>
   </properties>
 
   <dependencyManagement>
