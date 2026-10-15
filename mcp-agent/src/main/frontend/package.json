@@ -9,17 +9,17 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@salt-ds/core": "1.67.0",
-    "@salt-ds/icons": "1.18.0",
-    "@salt-ds/theme": "1.43.0",
-    "react": "19.0.2",
-    "react-dom": "19.0.2"
+    "@salt-ds/core": "1.72.0",
+    "@salt-ds/icons": "1.18.3",
+    "@salt-ds/theme": "1.47.0",
+    "react": "19.3.1",
+    "react-dom": "19.3.1"
   },
   "devDependencies": {
-    "@types/react": "19.2.18",
-    "@types/react-dom": "19.2.4",
-    "@vitejs/plugin-react": "6.0.5",
-    "typescript": "5.9.3",
-    "vite": "8.2.0"
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.1.2",
+    "typescript": "7.0.2",
+    "vite": "8.3.4"
   }
 }
