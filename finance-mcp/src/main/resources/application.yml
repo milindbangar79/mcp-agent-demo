@@ -17,6 +17,11 @@ spring:
 server:
   port: 8082
 
+mcp:
+  rate-limit:
+    # Shared across ALL tools on this server (sliding 1s window).
+    requests-per-second: 100
+
 logging:
   level:
     com.milind.financemcp: INFO

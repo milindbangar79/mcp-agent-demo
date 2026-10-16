@@ -21,6 +21,9 @@ spring:
             comms-mcp:                # Communication Skill — send_greeting
               url: http://localhost:8084
               endpoint: /mcp
+            employee-mcp:             # Employee Skill — get_employee_details, search_employees
+              url: http://localhost:8085
+              endpoint: /mcp
     ollama:
       base-url: http://localhost:11434
       chat:
@@ -32,6 +35,11 @@ spring:
 
 server:
   port: 8080
+
+# Agent-to-agent link. The key must match employee-agent's agent.security.api-key.
+employee-agent:
+  url: http://localhost:8086
+  api-key: ${AGENT_SHARED_API_KEY:dev-only-shared-key}
 
 logging:
   level:
