@@ -104,6 +104,8 @@ finance-mcp     research-mcp   comms-mcp    employee-mcp     employee-agent (:80
 (agent-to-agent), or directly through `employee-mcp`'s tools (agent-to-MCP). Both are
 registered with the same LLM and it chooses; the system prompt allows either.
 
+> **Animated version:** step through these call flows (direct MCP, agent-to-agent, wrong API key, rate limit) in the [interactive call-flow diagram](https://claude.ai/artifact/D8cDctBX5RcyD5BaDBNtyb). The page is private to its owner unless shared.
+
 ### What happens at startup
 
 1. `mcp-agent` boots and its MCP client connects to each server listed in `application.yml`.
@@ -124,7 +126,7 @@ The primary agent. (`employee-agent`, §3.6, is the only other module with an LL
 
 ```
 mcp-agent/
-├── src/main/java/com/yourorg/mcpagent/
+├── src/main/java/com/milind/mcpagent/
 │   ├── Application.java
 │   ├── api/
 │   │   └── AgentController.java        ← REST: POST /chat, GET /tools
@@ -158,8 +160,7 @@ finance-mcp/
     ├── api/FinanceMcpTools.java         ← @McpTool surface
     ├── domain/SimpleInterestCalculator.java
     ├── domain/CompoundInterestCalculator.java
-    ├── domain/BatchCompoundInterestService.java
-    └── ratelimit/                       ← SlidingWindowRateLimiter, RateLimitConfig, exception
+    └── domain/BatchCompoundInterestService.java   (rate limiting: shared mcp-ratelimit)
 ```
 
 **Tools exposed:**
@@ -232,8 +233,7 @@ employee-mcp/
     ├── api/EmployeeMcpTools.java        ← @McpTool surface; parses/validates inputs
     ├── domain/Employee.java             ← record: id, name, dateOfBirth, region, country, state, salary
     ├── domain/EmployeeRepository.java   ← in-memory seed data (swap for a real store here)
-    ├── domain/EmployeeService.java      ← search logic
-    └── ratelimit/                       ← shared 100 RPS limiter
+    └── domain/EmployeeService.java      ← search logic   (rate limiting: shared mcp-ratelimit)
 ```
 
 **Tools exposed:**
@@ -266,12 +266,50 @@ calling agent can pass them on to finance tools. See §8 for the interaction and
 
 ---
 
-### 3.7 `general-purpose-mcp` — Legacy (port 8081)
+### 3.7 `mcp-ratelimit` — Shared rate-limit library
+
+A plain library jar (no `spring-boot-maven-plugin`) that finance-mcp and employee-mcp depend on.
+
+```
+mcp-ratelimit/
+├── src/main/java/com/milind/mcpratelimit/
+│   ├── ToolRateLimiter.java              ← Bucket4j token bucket; tryAcquire() / acquireOrThrow()
+│   ├── RateLimitExceededException.java
+│   ├── RateLimitProperties.java          ← mcp.rate-limit.requests-per-second (default 100, must be > 0)
+│   └── RateLimitAutoConfiguration.java   ← registers ONE ToolRateLimiter bean (@ConditionalOnMissingBean)
+└── src/main/resources/META-INF/spring/
+    └── org.springframework.boot.autoconfigure.AutoConfiguration.imports
+```
+
+A server just adds the dependency, sets the YAML property, and injects `ToolRateLimiter` into its
+tool class. **Enforcement scope is unchanged by the extraction**: the bucket is per server (one bean
+per application) and each tool method calls `acquireOrThrow()` first. Defining your own
+`ToolRateLimiter` bean (e.g. Redis-backed) overrides the auto-configured one.
+
+---
+
+### 3.8 `general-purpose-mcp` — Legacy (port 8081)
 
 The original single server that held all three tools before the skill split. It is
 no longer connected to `mcp-agent` (the YAML connections now point to the three
 skill servers). Kept for reference; safe to delete once the three skill servers are
 confirmed stable.
+
+### 3.9 Maven layout (multi-module)
+
+```
+mcp-agent-demo/                (root pom: com.milind:mcp-agent-demo, packaging=pom)
+├── pom.xml                    ← parent: spring-boot-starter-parent 4.1.1; manages Spring AI BOM,
+│                                 Bucket4j and mcp-ratelimit versions; lists <modules>
+├── mcp-ratelimit/             ← library (auto-configuration)
+├── finance-mcp/  employee-mcp/            ← depend on mcp-ratelimit
+├── research-mcp/ comms-mcp/ general-purpose-mcp/
+├── employee-agent/ mcp-agent/
+```
+
+Modules inherit `groupId` (`com.milind`) and `version` from the root. Only Maven coordinates were
+unified; Java package names are unchanged by this restructuring. The `frontend-maven-plugin` stays
+in `mcp-agent`. Build everything with `mvn test` from the root; see README → Build.
 
 ---
 
@@ -731,27 +769,42 @@ tool method (e.g. search_employees)
 MCP response: result.isError = true with the message  (client/LLM sees the text)
 ```
 
-- `SlidingWindowRateLimiter`: a `synchronized` deque of admitted-call timestamps (`System.nanoTime`).
-  Entries older than 1s are evicted on each call; if 100 remain, the call is rejected.
-  This is a **strict** sliding window — never more than 100 admitted in *any* trailing second
-  (a fixed window or token bucket with burst could admit up to 2× at a boundary).
+- `ToolRateLimiter` wraps a **Bucket4j token bucket** (`bucket4j_jdk17-core`): capacity = refill =
+  100, greedy refill over 1s. A burst of up to 100 calls is admitted instantly; after that, tokens
+  return continuously, so the long-run average is capped at 100/s. This is the accepted
+  semantic ("burstable is acceptable"): in a worst-case window slightly more than 100 can pass
+  (the burst plus tokens refilled during that second). A strict never-above-100-in-any-second cap
+  would need a sliding-window counter or an extra smaller limit (e.g. 10 per 100 ms).
 - One `@Bean` per server (`RateLimitConfig`), injected into the tool class, so every tool
   draws from the same budget. Limit is configurable: `mcp.rate-limit.requests-per-second` (default 100).
-- Memory is bounded by the limit (≤ 100 timestamps).
+- Lock-free and constant memory (one bucket state).
 - Rejected calls are **not** queued or retried by the server; the caller must back off.
-- The limiter class is duplicated in both servers (there is no shared library module).
+- The limiter lives once, in the shared `mcp-ratelimit` module (§3.7), and is auto-configured into
+  each server; there is no per-server copy.
+- Going multi-instance means supplying a `ToolRateLimiter` backed by a Bucket4j `ProxyManager`
+  (Redis/JCache/Hazelcast) — as an override bean or a new factory in `mcp-ratelimit`. Tool code does not change.
 
 ### 10.3 Verified behaviour
 
-A parallel burst of 300 `get_employee_details` calls against `employee-mcp` produced exactly
-100 successes and 200 `isError: true` rejections (see README for the command).
+A parallel burst of 300 `get_employee_details` calls against `employee-mcp` produced 122
+successes and 178 `isError: true` rejections: the 100-call burst plus tokens refilled while the
+burst ran (see README for the command). Unit tests use a fake clock to assert burst, full refill
+and proportional partial refill.
 
 ### 10.4 Limitations
 
 - In-process: with more than one replica of a server, the effective limit is 100 × replicas.
-  A shared limiter (e.g. Redis, or a gateway) would be needed for a true cluster-wide cap.
+  Use a Bucket4j distributed backend (Redis) or a gateway for a true cluster-wide cap — not yet implemented.
 - Global per server, not per client: one noisy caller can exhaust the budget for everyone.
 - The rejection surfaces as a tool error the LLM must interpret; `mcp-agent` does not auto-retry.
+
+### 10.5 Server-level vs tool-level limiting
+
+The limit is enforced **at the tool level** (the requirement): it counts only `tools/call`
+executions, returns an MCP tool error the model can read, and can later be weighted or split per tool.
+It does not protect the HTTP layer (`initialize`, `tools/list`, malformed floods, SSE keep-alives).
+Recommended layering for deployment: a coarse per-client limit at the gateway/ingress (HTTP 429)
+**plus** this tool-level limit (and input bounds/timeouts) behind it.
 
 ---
 
@@ -872,11 +925,12 @@ JSON-RPC machinery beyond this demo's scope.
 The requirement was "simple security". A constant-time key check in one small filter is easy
 to audit and has no extra dependencies. JWT/mTLS is the documented hardening path (§9.4).
 
-### Why a sliding-window limiter written in-house?
+### Why Bucket4j instead of the hand-written limiter?
 
-It gives a strict "never more than 100 in any second" guarantee with ~30 lines and no
-dependency; token-bucket libraries allow bursts above the nominal rate. It is per-JVM, which
-is adequate for single-instance servers (§10.4 for the cluster caveat).
+The first version was a ~30-line in-house sliding window (strict, but per-JVM only). Since higher
+environments will run several instances, we moved to Bucket4j: a maintained, lock-free token
+bucket whose Redis/JCache/Hazelcast backends give a cluster-wide limit without changing the tool
+code. The trade-off, accepted explicitly, is burst semantics instead of a strict per-second ceiling.
 
 ### Why a batch compound-interest tool?
 

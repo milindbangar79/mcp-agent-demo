@@ -12,7 +12,7 @@ import com.milind.financemcp.domain.CompoundInterestCalculator.CompoundInterestR
 import com.milind.financemcp.domain.SimpleInterestCalculator;
 import com.milind.financemcp.domain.SimpleInterestCalculator.SimpleInterestResult;
 
-import com.milind.financemcp.ratelimit.SlidingWindowRateLimiter;
+import com.milind.mcpratelimit.ToolRateLimiter;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -29,12 +29,12 @@ public class FinanceMcpTools {
 
     private final CompoundInterestCalculator compoundCalculator;
     private final BatchCompoundInterestService batchService;
-    private final SlidingWindowRateLimiter rateLimiter;
+    private final ToolRateLimiter rateLimiter;
 
     public FinanceMcpTools(SimpleInterestCalculator calculator,
                            CompoundInterestCalculator compoundCalculator,
                            BatchCompoundInterestService batchService,
-                           SlidingWindowRateLimiter rateLimiter) {
+                           ToolRateLimiter rateLimiter) {
         this.calculator = calculator;
         this.compoundCalculator = compoundCalculator;
         this.batchService = batchService;
