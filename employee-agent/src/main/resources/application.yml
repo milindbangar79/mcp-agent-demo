@@ -1,0 +1,36 @@
+spring:
+  application:
+    name: employee-agent
+  ai:
+    mcp:
+      client:
+        enabled: true
+        name: employee-agent
+        version: 0.1.0
+        type: SYNC
+        request-timeout: 60s
+        streamable-http:
+          connections:
+            employee-mcp:
+              url: http://localhost:8085
+              endpoint: /mcp
+    ollama:
+      base-url: http://localhost:11434
+      chat:
+        model: llama3.1:8b
+        options:
+          temperature: 0.2
+
+server:
+  port: 8086
+
+agent:
+  security:
+    # Shared secret mcp-agent must send in the X-API-Key header.
+    # Override in any non-local environment: AGENT_SHARED_API_KEY=<long random value>
+    api-key: ${AGENT_SHARED_API_KEY:dev-only-shared-key}
+
+logging:
+  level:
+    com.milind.employeeagent: INFO
+    org.springframework.ai: INFO

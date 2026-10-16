@@ -1,7 +1,8 @@
 # Architecture & Design — MCP Agent Demo
 
 > A Spring Boot 4 + Spring AI 2.0 project demonstrating LLM-orchestrated tool calling
-> over the Model Context Protocol (MCP), with a skill-based server architecture and
+> over the Model Context Protocol (MCP), with a skill-based server architecture, a
+> peer agent reached over a secured agent-to-agent link, per-server rate limiting, and
 > a React 19 frontend.
 
 ---
@@ -15,10 +16,13 @@
 5. [Skill Architecture](#5-skill-architecture)
 6. [Frontend Architecture](#6-frontend-architecture)
 7. [Data Flow](#7-data-flow)
-8. [Technology Stack](#8-technology-stack)
-9. [Running the System](#9-running-the-system)
-10. [Design Decisions](#10-design-decisions)
-11. [Roadmap](#11-roadmap)
+8. [Multi-Agent Design (employee-agent)](#8-multi-agent-design-employee-agent)
+9. [Security](#9-security)
+10. [Rate Limiting](#10-rate-limiting)
+11. [Technology Stack](#11-technology-stack)
+12. [Running the System](#12-running-the-system)
+13. [Design Decisions](#13-design-decisions)
+14. [Roadmap](#14-roadmap)
 
 ---
 
@@ -32,11 +36,13 @@ across the industry. This section defines how they are used in this project.
 | **MCP (Model Context Protocol)** | An open standard for exposing callable functions (tools) to LLMs over HTTP. Each MCP server advertises a `tools/list` and handles `tools/call`. |
 | **Tool** | A single callable function exposed by an MCP server — e.g. `calculate_simple_interest`. |
 | **Skill** | A domain-scoped MCP server that groups related tools — e.g. `finance-mcp` groups all financial calculation tools. One server = one skill. |
-| **Agent** | An LLM that has access to tools and a loop: it decides which tools to call, sees the results, and decides again until it can produce a final answer. `mcp-agent` is the agent in this project. |
+| **Agent** | An LLM that has access to tools and a loop: it decides which tools to call, sees the results, and decides again until it can produce a final answer. This project has two: `mcp-agent` (primary) and `employee-agent` (peer, employee domain). |
+| **Agent-to-agent (A2A) link** | A call from one agent to another agent over REST. Here: `mcp-agent` → `employee-agent`, exposed to the primary LLM as the local tool `ask_employee_agent` and secured with an `X-API-Key` header. This is a simple custom REST contract, **not** the Google A2A protocol. |
 | **Tool-calling loop** | The back-and-forth between the LLM and the tool executor. Spring AI's `ChatClient` runs this loop internally — it is not visible as explicit code. |
 | **Orchestration** | Coordination of multiple agents or tool calls. In this project, `OrchestrationService` is a single agent entry point — the LLM does the orchestration by chaining tool calls. |
 | **Workflow** | A _fixed_ sequence of steps with no LLM deciding the path. Not implemented here — this project is fully LLM-driven. |
-| **Sub-agent** | A second, specialised LLM instance that the primary orchestrator delegates to. Not implemented yet — see Roadmap. |
+| **Sub-agent** | A second, specialised LLM instance that the primary orchestrator delegates to. `employee-agent` is the first one (employee domain). There is still no router — the primary LLM decides when to delegate. |
+| **Rate limit** | A cap on tool calls. Each of `employee-mcp` and `finance-mcp` allows 100 calls/second shared across all of its tools. |
 | **System prompt** | The standing instruction to the LLM that defines its persona, rules, and tool-use behaviour. Lives in `ChatClientConfig`. |
 
 ---
@@ -73,12 +79,40 @@ across the industry. This section defines how they are used in this project.
   /mcp endpoint      /mcp endpoint        /mcp endpoint
 ```
 
+### Full topology (with employee-agent and employee-mcp)
+
+```
+                         User / Browser (React UI)
+                                  │  POST /api/agent/chat · GET /api/agent/tools
+                                  ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│                       mcp-agent (:8080)  — primary LLM                   │
+│  AgentController → OrchestrationService → ChatClient (Ollama)            │
+│                                                │ tool-calling loop       │
+│   tools = MCP tools (auto-discovered) + ask_employee_agent (local @Tool) │
+└───┬───────────────┬──────────────┬──────────────┬───────────────┬────────┘
+    │ MCP           │ MCP          │ MCP          │ MCP           │ REST + X-API-Key
+    ▼               ▼              ▼              ▼               ▼
+finance-mcp     research-mcp   comms-mcp    employee-mcp     employee-agent (:8086)
+ (:8082)          (:8083)        (:8084)      (:8085)        own Ollama ChatClient
+ 100 RPS cap                                  100 RPS cap            │ MCP
+ simple + compound                            get_employee_details   ▼
+ interest (+batch)                            search_employees   employee-mcp (:8085)
+```
+
+`mcp-agent` has **two routes to employee data**: indirectly through `employee-agent`
+(agent-to-agent), or directly through `employee-mcp`'s tools (agent-to-MCP). Both are
+registered with the same LLM and it chooses; the system prompt allows either.
+
 ### What happens at startup
 
 1. `mcp-agent` boots and its MCP client connects to each server listed in `application.yml`.
 2. For each server, it calls `tools/list` and receives the tool schemas (name, description, JSON parameter schema).
 3. Spring AI adapts each discovered tool into a `ToolCallback` and registers it with the `ChatClient` via `ToolCallbackProvider`.
-4. The LLM now knows about all tools from all three skill servers — no code change needed to add a new skill.
+4. The LLM now knows about all tools from every skill server (finance, research, comms, employee) — no code change needed to add a new skill.
+5. `EmployeeAgentTools` (a regular Spring `@Component`, not discovered via MCP) is added to the same `ChatClient` as the local tool `ask_employee_agent`. `employee-agent` is **not** contacted at startup — it is called lazily on first use.
+
+`employee-agent` runs the same discovery against `employee-mcp` at *its* startup, so `employee-mcp` must be up before `employee-agent`.
 
 ---
 
@@ -86,7 +120,7 @@ across the industry. This section defines how they are used in this project.
 
 ### 3.1 `mcp-agent` — The Agent (port 8080)
 
-The only module with an LLM. All other modules are stateless tool servers.
+The primary agent. (`employee-agent`, §3.6, is the only other module with an LLM; all other modules are stateless tool servers.)
 
 ```
 mcp-agent/
@@ -95,7 +129,9 @@ mcp-agent/
 │   ├── api/
 │   │   └── AgentController.java        ← REST: POST /chat, GET /tools
 │   ├── config/
-│   │   └── ChatClientConfig.java       ← Wires Ollama + system prompt + tools
+│   │   └── ChatClientConfig.java       ← Wires Ollama + system prompt + MCP tools + ask_employee_agent
+│   ├── employee/
+│   │   └── EmployeeAgentTools.java     ← @Tool ask_employee_agent: REST call to employee-agent with X-API-Key
 │   └── domain/
 │       └── OrchestrationService.java   ← Entry point for agent invocation
 └── src/main/
@@ -107,6 +143,7 @@ mcp-agent/
 
 - `ChatClientConfig` — builds the `ChatClient` bean with the system prompt and all discovered MCP tools wired in. This is where the LLM's behaviour is defined.
 - `OrchestrationService.orchestrate(prompt)` — single method that fires the tool-calling loop. Spring AI handles everything internally.
+- `EmployeeAgentTools.askEmployeeAgent(question)` — local Spring AI `@Tool`. Builds a `RestClient` with `employee-agent.url` and a default `X-API-Key` header (`employee-agent.api-key`), then `POST /api/employee/ask`. It is a local tool, so it does **not** appear in `GET /api/agent/tools` (which lists only MCP-discovered tools).
 - `AgentController` — thin REST wrapper. `POST /api/agent/chat` drives the agent; `GET /api/agent/tools` exposes discovered tools deterministically (no LLM, straight from `tools/list`).
 
 ---
@@ -119,7 +156,10 @@ mcp-agent/
 finance-mcp/
 └── src/main/java/com/milind/financemcp/
     ├── api/FinanceMcpTools.java         ← @McpTool surface
-    └── domain/SimpleInterestCalculator.java
+    ├── domain/SimpleInterestCalculator.java
+    ├── domain/CompoundInterestCalculator.java
+    ├── domain/BatchCompoundInterestService.java
+    └── ratelimit/                       ← SlidingWindowRateLimiter, RateLimitConfig, exception
 ```
 
 **Tools exposed:**
@@ -127,6 +167,10 @@ finance-mcp/
 | Tool | Description |
 |---|---|
 | `calculate_simple_interest` | Computes SI = (P × R × T) / 100. Returns interest and total amount as `BigDecimal` (no floating-point drift). |
+| `calculate_compound_interest` | One principal. `A = P·(1 + r/(100·n))^(n·t)`. Inputs: principal, annual rate %, years, compounds per year (1 annual, 4 quarterly, 12 monthly). `years × n` must be a whole number of periods, otherwise the call is rejected rather than approximated. |
+| `calculate_compound_interest_batch` | Many principals, same rate/term/compounding. Input: list of `{id, principal}` (max 500), e.g. `id` = employeeId, `principal` = salary. Returns per-item results plus `totalInterest` and `totalAmount`. |
+
+All three tools call the shared rate limiter first (§10).
 
 ---
 
@@ -178,7 +222,51 @@ comms-mcp/
 
 ---
 
-### 3.5 `general-purpose-mcp` — Legacy (port 8081)
+### 3.5 `employee-mcp` — Employee Skill (port 8085)
+
+**Domain:** employee data. Stateless MCP server over in-memory sample data (E001–E008).
+
+```
+employee-mcp/
+└── src/main/java/com/milind/employeemcp/
+    ├── api/EmployeeMcpTools.java        ← @McpTool surface; parses/validates inputs
+    ├── domain/Employee.java             ← record: id, name, dateOfBirth, region, country, state, salary
+    ├── domain/EmployeeRepository.java   ← in-memory seed data (swap for a real store here)
+    ├── domain/EmployeeService.java      ← search logic
+    └── ratelimit/                       ← shared 100 RPS limiter
+```
+
+**Tools exposed:**
+
+| Tool | Description |
+|---|---|
+| `get_employee_details` | One employee by `employeeId` (case-insensitive). Unknown id → tool error. |
+| `search_employees` | Dynamic search. Optional filters: `employeeId`, `dateOfBirth` (exact), `dobFrom`/`dobTo` (inclusive range), `region`, `country`, `state`. Filters are **AND-combined**; text matches are case-insensitive; dates are `yyyy-MM-dd`. **At least one filter is required** so a call can never dump the whole table; `dobFrom > dobTo` is rejected. |
+
+Salary is returned because it is the principal fed into the finance tools.
+
+---
+
+### 3.6 `employee-agent` — Employee peer agent (port 8086)
+
+**Domain:** answering employee questions for `mcp-agent`. Has its own Ollama `ChatClient`
+and its own MCP client to `employee-mcp`.
+
+```
+employee-agent/
+└── src/main/java/com/milind/employeeagent/
+    ├── api/EmployeeAgentController.java  ← POST /api/employee/ask {question} → {answer}
+    ├── config/ChatClientConfig.java      ← system prompt + employee-mcp tools
+    └── security/ApiKeyFilter.java        ← X-API-Key check on /api/**
+```
+
+Its system prompt tells it to always use the tools, never invent data, and return matching
+employees' fields completely (id, name, dateOfBirth, region, country, state, salary) so the
+calling agent can pass them on to finance tools. See §8 for the interaction and §9 for security.
+
+---
+
+### 3.7 `general-purpose-mcp` — Legacy (port 8081)
 
 The original single server that held all three tools before the skill split. It is
 no longer connected to `mcp-agent` (the YAML connections now point to the three
@@ -228,8 +316,15 @@ Defined in `ChatClientConfig.SYSTEM_PROMPT`. The rules are:
    with the relevant topic. Include ALL returned items verbatim — do not filter,
    summarize, or omit any. Organize under: Online Calculators, Articles,
    Training Content.
-4. If no tool applies, say so and list available tools.
-5. Be concise and state which tool(s) you called.
+4. Employee data: call ask_employee_agent, or the employee-mcp tools directly. Never
+   invent employee data.
+5. Compound interest for employees: first get the employees and salaries, then use
+   salary as the principal. ONE employee → calculate_compound_interest; MANY →
+   calculate_compound_interest_batch once with every employee as an item
+   (id = employeeId, principal = salary). If rate, years or compounds-per-year is
+   missing, ask the user — do not assume.
+6. If no tool applies, say so and list available tools.
+7. Be concise and state which tool(s) you called.
 ```
 
 **Why rule 3 is explicit about "do not filter":** LLMs trained with RLHF learn to
@@ -263,13 +358,19 @@ directly to equivalent concepts in other frameworks:
 
 ```
 finance-mcp   (:8082)  ─── Finance Skill
-  └── calculate_simple_interest
+  ├── calculate_simple_interest
+  ├── calculate_compound_interest
+  └── calculate_compound_interest_batch
 
 research-mcp  (:8083)  ─── Research Skill
   └── search_learning_resources
 
 comms-mcp     (:8084)  ─── Communication Skill
   └── send_greeting
+
+employee-mcp  (:8085)  ─── Employee Skill
+  ├── get_employee_details
+  └── search_employees
 ```
 
 ### 5.3 Adding a new skill
@@ -283,7 +384,7 @@ Adding a new skill requires:
 ```yaml
 spring.ai.mcp.client.streamable-http.connections:
   my-new-skill:
-    url: http://localhost:8085
+    url: http://localhost:8087      # pick a free port (8085 = employee-mcp, 8086 = employee-agent)
     endpoint: /mcp
 ```
 
@@ -295,9 +396,10 @@ at startup and the LLM can immediately invoke them.
 Skills can be thought of at three levels of sophistication:
 
 ```
-Layer 3 — Sub-agents (separate LLMs, not yet implemented)
-  Each domain gets its own ChatClient with a tailored system prompt.
-  The orchestrator routes requests to the correct sub-agent.
+Layer 3 — Sub-agents (first one implemented: employee-agent)
+  A domain gets its own ChatClient with a tailored system prompt, reached over a
+  secured REST link. There is no router yet: the primary LLM decides to delegate
+  by calling ask_employee_agent. See §8.
 
 Layer 2 — Skill Packs (current implementation)
   Each domain is an MCP server. One LLM discovers and chains all tools.
@@ -468,9 +570,192 @@ OrchestrationService.discoverTools()
 ToolsPanel renders each tool as a card grouped by server
 ```
 
+### 7.3 Employee flow, one employee: "Compound interest on E001's salary at 7% for 3 years, annually"
+
+```
+Browser → POST /api/agent/chat → mcp-agent ChatClient → Ollama
+  │  tool_calls = [ get_employee_details(E001) ]            (direct agent→MCP route)
+  ▼
+employee-mcp  tools/call get_employee_details
+  │  ← { employeeId: E001, name: "Priya Sharma", ..., salary: 85000.00 }
+  ▼
+Ollama (pass 2) → tool_calls = [ calculate_compound_interest(85000, 7, 3, 1) ]
+  ▼
+finance-mcp   tools/call calculate_compound_interest
+  │  ← { principal: 85000.00, interest: 19128.66, totalAmount: 104128.66 }
+  ▼
+Ollama (pass 3) → final text → { "answer": "..." }
+```
+
+The LLM may instead call `ask_employee_agent("details of E001")` for
+the first hop — that variant is in §8.2.
+
+### 7.4 Employee flow, many employees: "For all employees in India, compound interest at 7% for 3 years"
+
+```
+Ollama → tool_calls = [ search_employees(country="India") ]
+  ▼
+employee-mcp  ← [ {E001, salary 85000}, {E002, salary 92000} ]
+  ▼
+Ollama → tool_calls = [ calculate_compound_interest_batch(
+             items=[{id:E001, principal:"85000"}, {id:E002, principal:"92000"}],
+             annualRatePercent=7, years=3, compoundsPerYear=1) ]       ← ONE call, not N
+  ▼
+finance-mcp   ← { entries:[...per employee...], totalInterest, totalAmount }
+  ▼
+Ollama → final answer
+```
+
+The dynamic filters are resolved entirely in `employee-mcp`; the LLM only maps the user's
+words onto filter arguments. The batch tool exists so a group costs one finance call and one
+rate-limit token instead of N.
+
 ---
 
-## 8. Technology Stack
+## 8. Multi-Agent Design (employee-agent)
+
+### 8.1 Why a second agent
+
+`employee-agent` demonstrates the *agent-calls-agent* pattern: a domain-specialised LLM with
+its own system prompt and tool set that the primary agent can delegate to, instead of the
+primary LLM holding every domain's rules. It also gives the A2A link something real to secure.
+
+### 8.2 Interaction and flow (agent → agent)
+
+```
+User → mcp-agent (LLM #1)
+          │ tool_call: ask_employee_agent("List all employees in India")
+          ▼
+   EmployeeAgentTools  (RestClient, header X-API-Key: <shared secret>)
+          │ POST http://localhost:8086/api/employee/ask   {"question": "..."}
+          ▼
+   employee-agent  ── ApiKeyFilter ──✗──▶ 401 {"error":"missing or invalid X-API-Key"}
+          │ ✓ key valid
+          ▼
+   EmployeeAgentController → ChatClient (LLM #2, employee system prompt)
+          │ tool_call: search_employees(country="India")
+          ▼
+   employee-mcp (rate-limited, 100 RPS) ← employees incl. salaries
+          │
+          ▼  LLM #2 writes the answer text
+   {"answer": "E001 Priya Sharma ... salary 85000.00; E002 ..."}
+          │
+          ▼
+   back in mcp-agent: the string is the tool result → LLM #1 continues
+          → e.g. calculate_compound_interest_batch on finance-mcp → final answer
+```
+
+Contract (the only coupling between the two agents):
+
+| | |
+|---|---|
+| Request | `POST /api/employee/ask`, header `X-API-Key`, body `{"question": "<natural language>"}` |
+| 200 | `{"answer": "<text>"}` |
+| 400 | blank question |
+| 401 | missing/incorrect key |
+
+### 8.3 Trade-offs of this design
+
+- **The hand-off is free text.** `employee-agent` returns prose, and `mcp-agent`'s LLM must
+  re-parse salaries out of it before calling finance. With a small local model this is the
+  weakest link (two LLM hops can drop or garble a value). The direct route
+  (`search_employees` → structured JSON → finance) avoids this, which is why both routes exist.
+- **Two LLM passes = more latency** than the direct MCP route.
+- **No router.** Which route is used depends on the primary LLM's judgement of the tool descriptions.
+- **Statelessness.** Each delegated question is independent; no shared conversation memory.
+
+---
+
+## 9. Security
+
+### 9.1 Threat model and scope
+
+This is a local demo with a **deliberately simple** control: one hop is authenticated; the rest
+is trusted-network. Do not treat it as production-grade.
+
+| Link | Protection | Notes |
+|---|---|---|
+| Browser → mcp-agent | none | no user authentication |
+| **mcp-agent → employee-agent** | **Shared secret, `X-API-Key` header** | enforced by `ApiKeyFilter` |
+| mcp-agent / employee-agent → MCP servers | none (rate limit only, §10) | any caller that can reach the port can call tools |
+| Transport | plain HTTP | no TLS |
+
+### 9.2 How the agent-to-agent control works
+
+- `ApiKeyFilter` is a servlet `OncePerRequestFilter` that applies only to paths starting with
+  `/api/`. A missing or incorrect header returns **401** before the request reaches the
+  controller — so no LLM call or MCP call is made for an unauthenticated request.
+- The comparison uses `MessageDigest.isEqual` (constant time) to avoid a timing side channel.
+- The service refuses to start if `agent.security.api-key` is blank.
+- Rejections are logged (`Rejected request to … missing or invalid X-API-Key`); the key value is never logged.
+- Plain servlet filter by design — no Spring Security dependency — to keep the control easy to read.
+
+### 9.3 Key configuration
+
+| Side | Property | Default |
+|---|---|---|
+| mcp-agent (sender) | `employee-agent.api-key` | `${AGENT_SHARED_API_KEY:dev-only-shared-key}` |
+| employee-agent (verifier) | `agent.security.api-key` | `${AGENT_SHARED_API_KEY:dev-only-shared-key}` |
+
+Both read the same environment variable, so exporting `AGENT_SHARED_API_KEY` before starting
+both processes keeps them in sync. **The default is for local use only.**
+
+### 9.4 Known limitations / hardening path
+
+- Static shared secret: rotation requires restarting both services; compromise of one side exposes the other.
+- No TLS — the key travels in clear text on the wire. Use HTTPS (or a service mesh) outside localhost.
+- No per-caller identity, scopes, or audit trail. Next step: short-lived signed JWTs (issuer, audience, expiry) or mTLS.
+- MCP servers are unauthenticated; Streamable HTTP supports bearer headers if needed.
+- Prompt injection: tool outputs (employee data, `employee-agent` prose) are fed back to an LLM; there is no output sanitisation.
+- Salary and DOB are sensitive data flowing through LLM prompts; fine for sample data, not for real HR data.
+
+---
+
+## 10. Rate Limiting
+
+### 10.1 Requirement and scope
+
+Max **100 requests per second across all tools** — implemented **per MCP server**: `employee-mcp`
+and `finance-mcp` each hold one shared budget of 100 calls/sec across *all of their own tools*.
+(There is no single global counter across servers, and `research-mcp`/`comms-mcp` are not limited.)
+
+### 10.2 Design
+
+```
+tool method (e.g. search_employees)
+   │  1. rateLimiter.acquireOrThrow()      ← first statement, before any work
+   │         ├─ window has < 100 calls in the last 1s → record timestamp, continue
+   │         └─ else → throw RateLimitExceededException("Rate limit exceeded: max 100 ...")
+   │  2. do the work
+   ▼
+MCP response: result.isError = true with the message  (client/LLM sees the text)
+```
+
+- `SlidingWindowRateLimiter`: a `synchronized` deque of admitted-call timestamps (`System.nanoTime`).
+  Entries older than 1s are evicted on each call; if 100 remain, the call is rejected.
+  This is a **strict** sliding window — never more than 100 admitted in *any* trailing second
+  (a fixed window or token bucket with burst could admit up to 2× at a boundary).
+- One `@Bean` per server (`RateLimitConfig`), injected into the tool class, so every tool
+  draws from the same budget. Limit is configurable: `mcp.rate-limit.requests-per-second` (default 100).
+- Memory is bounded by the limit (≤ 100 timestamps).
+- Rejected calls are **not** queued or retried by the server; the caller must back off.
+- The limiter class is duplicated in both servers (there is no shared library module).
+
+### 10.3 Verified behaviour
+
+A parallel burst of 300 `get_employee_details` calls against `employee-mcp` produced exactly
+100 successes and 200 `isError: true` rejections (see README for the command).
+
+### 10.4 Limitations
+
+- In-process: with more than one replica of a server, the effective limit is 100 × replicas.
+  A shared limiter (e.g. Redis, or a gateway) would be needed for a true cluster-wide cap.
+- Global per server, not per client: one noisy caller can exhaust the budget for everyone.
+- The rejection surfaces as a tool error the LLM must interpret; `mcp-agent` does not auto-retry.
+
+---
+
+## 11. Technology Stack
 
 | Layer | Technology | Version | Why |
 |---|---|---|---|
@@ -488,7 +773,7 @@ ToolsPanel renders each tool as a card grouped by server
 
 ---
 
-## 9. Running the System
+## 12. Running the System
 
 ### Port assignments
 
@@ -499,13 +784,17 @@ ToolsPanel renders each tool as a card grouped by server
 | `finance-mcp` | 8082 | Finance Skill MCP server |
 | `research-mcp` | 8083 | Research Skill MCP server |
 | `comms-mcp` | 8084 | Communication Skill MCP server |
+| `employee-mcp` | 8085 | Employee Skill MCP server (100 RPS cap) |
+| `employee-agent` | 8086 | Peer agent, REST `/api/employee/ask` (X-API-Key) |
 | React dev server | 5173 | Development only (proxies /api → :8080) |
 
 ### Startup order
 
-The skill servers must be up _before_ `mcp-agent` starts, because the MCP client
-connects and calls `tools/list` at startup. If a skill server is unavailable,
-`mcp-agent` will fail to start.
+The skill servers must be up _before_ their MCP client starts, because the client
+connects and calls `tools/list` at startup. If one is unavailable, that client's app
+will fail to start. Dependency order: `employee-mcp` → `employee-agent`;
+all skill servers → `mcp-agent`. (`mcp-agent` calls `employee-agent` lazily, so it can
+start before it, but delegation fails until `employee-agent` is up.)
 
 ```bash
 # 1. Ensure Ollama is running
@@ -515,8 +804,13 @@ ollama serve                    # or start via the Ollama desktop app
 cd finance-mcp  && mvn spring-boot:run   # terminal 1
 cd research-mcp && mvn spring-boot:run   # terminal 2
 cd comms-mcp    && mvn spring-boot:run   # terminal 3
+cd employee-mcp && mvn spring-boot:run   # terminal 3b
 
-# 3. Start the agent (after all three skill servers are ready)
+# 2b. Start the peer agent (needs employee-mcp). Same key as mcp-agent!
+export AGENT_SHARED_API_KEY='a-long-random-value'   # export in the mcp-agent terminal too
+cd employee-agent && mvn spring-boot:run # terminal 3c
+
+# 3. Start the agent (after the skill servers are ready)
 cd mcp-agent    && mvn spring-boot:run   # terminal 4
 
 # 4. Open the UI
@@ -533,7 +827,7 @@ npm run dev               # → http://localhost:5173 (hot reload, proxies /api)
 
 ---
 
-## 10. Design Decisions
+## 13. Design Decisions
 
 ### Why MCP instead of direct REST calls between services?
 
@@ -558,13 +852,37 @@ A single MCP server with all tools works technically, but has two problems at sc
    increases the chance of wrong tool selection. Domain-scoped servers make the
    tool set per server smaller and more semantically coherent.
 
-### Why not two LLMs / sub-agents yet?
+### Why add a second LLM (employee-agent) after all?
 
-Two LLMs are needed only when the domains require _different LLM configurations_
-(e.g. different temperatures, different base models, or isolated conversation memory).
-With one LLM and three tool domains, the tool-calling loop handles cross-domain
-requests naturally. Adding a second LLM adds operational complexity (two Ollama
-model loads, manual routing logic) without a clear benefit at this scale.
+Originally a single LLM sufficed. `employee-agent` was added as a deliberate step to
+demonstrate agent-to-agent delegation and to give the A2A link a security boundary.
+The cost is real (two LLM hops, free-text hand-off, extra Ollama load — see §8.3), so the
+direct `employee-mcp` route is kept as the structured, lower-latency path. A second LLM is
+justified when a domain needs its own prompt/model/memory or an independent trust boundary.
+
+### Why a plain REST link instead of the A2A protocol or MCP for agent-to-agent?
+
+A single `POST` with a shared key is the smallest thing that demonstrates delegation plus
+authentication. Exposing `employee-agent` as an MCP server would let `mcp-agent` discover it
+automatically but would hide the security boundary; the A2A protocol adds agent cards and
+JSON-RPC machinery beyond this demo's scope.
+
+### Why an API key and a servlet filter rather than Spring Security / JWT?
+
+The requirement was "simple security". A constant-time key check in one small filter is easy
+to audit and has no extra dependencies. JWT/mTLS is the documented hardening path (§9.4).
+
+### Why a sliding-window limiter written in-house?
+
+It gives a strict "never more than 100 in any second" guarantee with ~30 lines and no
+dependency; token-bucket libraries allow bursts above the nominal rate. It is per-JVM, which
+is adequate for single-instance servers (§10.4 for the cluster caveat).
+
+### Why a batch compound-interest tool?
+
+"A bunch of employees" would otherwise be N finance calls, N LLM round-trips and N rate-limit
+tokens. One batch call keeps the LLM's job to a single structured tool call and the arithmetic
+in `BigDecimal` on the server.
 
 ### Why `BigDecimal` for financial arithmetic?
 
@@ -590,7 +908,7 @@ the tool result is correct but the LLM's response silently drops data.
 
 ---
 
-## 11. Roadmap
+## 14. Roadmap
 
 The following are natural next steps, in rough priority order.
 
@@ -603,13 +921,19 @@ Add domain-specific behaviour rules to the system prompt in `ChatClientConfig`:
 ### Layer 2 — Richer skill servers (medium effort)
 
 Extend existing skill servers with more tools:
-- `finance-mcp`: compound interest, loan amortization, currency conversion.
+- `finance-mcp`: loan amortization, currency conversion (compound interest is done).
 - `research-mcp`: swap hardcoded resources for live Tavily/Brave Search API call.
 - `comms-mcp`: email/Slack notification tool.
 
-### Layer 3 — Sub-agents (higher effort, architecturally significant)
+### Security & rate-limit hardening (see §9.4, §10.4)
 
-Split `OrchestrationService` into a router + domain agents:
+Signed JWT or mTLS between agents, TLS everywhere, authenticated MCP servers, per-client
+quotas, and a shared (cluster-wide) limiter.
+
+### Layer 3 — Sub-agents (first one done; router still open)
+
+`employee-agent` is the first sub-agent, reached by explicit tool call. Remaining work: a
+router and more domain agents. Split `OrchestrationService` into a router + domain agents:
 
 ```java
 // Router LLM — lightweight, just classifies the request

@@ -1,5 +1,7 @@
 package com.yourorg.mcpagent.config;
 
+import com.yourorg.mcpagent.employee.EmployeeAgentTools;
+
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.tool.ToolCallbackProvider;
 import org.springframework.context.annotation.Bean;
@@ -33,6 +35,14 @@ public class ChatClientConfig {
               items in your response verbatim — do not filter, summarize, or omit any. \
               Organize them under three headings: Online Calculators, Articles, and \
               Training Content. For each item list its name, URL, and description.
+            - Employee data: call ask_employee_agent (delegates to employee-agent), or the \
+              employee-mcp tools get_employee_details / search_employees directly. Never invent \
+              employee data.
+            - Compound interest for employees: first obtain the employees and their salaries, then \
+              use salary as the principal. For ONE employee call calculate_compound_interest; for \
+              MANY employees call calculate_compound_interest_batch once with every employee as an \
+              item (id = employeeId, principal = salary). If the user did not give the annual rate, \
+              years, or compounds per year, ask for the missing value instead of assuming it.
             - If the user asks what you can do, or their request only partially matches \
               a tool, list the available tools with their names and one-line descriptions \
               and suggest which one(s) apply to their request.
@@ -41,9 +51,11 @@ public class ChatClientConfig {
             """;
 
     @Bean
-    ChatClient chatClient(ChatClient.Builder builder, ToolCallbackProvider mcpToolCallbackProvider) {
+    ChatClient chatClient(ChatClient.Builder builder, ToolCallbackProvider mcpToolCallbackProvider,
+                          EmployeeAgentTools employeeAgentTools) {
         return builder
-                .defaultSystem(SYSTEM_PROMPT).defaultTools(mcpToolCallbackProvider)
+                .defaultSystem(SYSTEM_PROMPT)
+                .defaultTools(mcpToolCallbackProvider, employeeAgentTools)
                 .build();
     }
 }

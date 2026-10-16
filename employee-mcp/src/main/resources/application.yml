@@ -1,0 +1,28 @@
+spring:
+  application:
+    name: employee-mcp
+  ai:
+    mcp:
+      server:
+        name: employee-mcp
+        version: 0.1.0
+        protocol: STREAMABLE
+        type: SYNC
+        annotation-scanner:
+          enabled: true
+        streamable-http:
+          mcp-endpoint: /mcp
+          keep-alive-interval: 30s
+
+server:
+  port: 8085
+
+mcp:
+  rate-limit:
+    # Shared across ALL tools on this server (sliding 1s window).
+    requests-per-second: 100
+
+logging:
+  level:
+    com.milind.employeemcp: INFO
+    org.springframework.ai: INFO
