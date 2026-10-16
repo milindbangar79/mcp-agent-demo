@@ -7,6 +7,8 @@ MCP skill servers and one peer agent**, with a React 19 frontend. The agent uses
 no API key or cloud dependency.
 
 > For full design rationale, data flows, and roadmap see [ARCHITECTURE.md](./ARCHITECTURE.md).
+>
+> **Animated call flow** between the agents and MCP servers (secured agent-to-agent link, rate limit): [open the diagram](https://claude.ai/artifact/D8cDctBX5RcyD5BaDBNtyb). The page is private to its owner unless shared.
 
 ---
 
@@ -40,7 +42,7 @@ Browser (React 19 / Salt DS)
 Employee + finance flow: `mcp-agent` obtains employees (via `employee-agent` or `employee-mcp`
 directly), then passes their salaries to `finance-mcp`'s compound-interest tools.
 
-Each MCP server is a standalone Spring Boot app. Adding a new skill = new module +
+Each MCP server is a standalone Spring Boot app (all modules build together as one Maven multi-module project, see [Build](#build)). Adding a new skill = new module +
 one YAML entry in `mcp-agent`. No agent code changes.
 
 ---
@@ -55,6 +57,7 @@ one YAML entry in `mcp-agent`. No agent code changes.
 | `comms-mcp` | 8084 | Communication Skill: `send_greeting` |
 | `employee-mcp` | 8085 | Employee Skill: `get_employee_details`, `search_employees` (100 RPS shared limit) |
 | `employee-agent` | 8086 | Agent called by mcp-agent (REST, `X-API-Key` secured); uses employee-mcp |
+| `mcp-ratelimit` | — | Shared library: Bucket4j tool-level rate limiter + Spring Boot auto-configuration (used by `finance-mcp`, `employee-mcp`) |
 | `general-purpose-mcp` | 8081 | Legacy — superseded by the three skill servers above |
 
 ---
@@ -73,6 +76,30 @@ one YAML entry in `mcp-agent`. No agent code changes.
 
 - **Node 20+** (only needed if running the React dev server separately — `mvn package`
   installs its own Node via `frontend-maven-plugin`)
+
+---
+
+## Build
+
+The repo is a Maven **multi-module project**: the root `pom.xml` (`com.milind:mcp-agent-demo`) is the
+parent/aggregator for `mcp-ratelimit` and all seven apps. It extends `spring-boot-starter-parent`, and
+centrally manages the Spring AI BOM, Bucket4j and the internal `mcp-ratelimit` version.
+
+```bash
+# everything (from the repo root); skip the React/Node build with the two -D flags
+mvn test -Dskip.npm -Dskip.installnodenpm
+# one module and what it depends on
+mvn test -pl finance-mcp -am
+```
+
+Running a single app with `cd <module> && mvn spring-boot:run` needs the parent and `mcp-ratelimit`
+in your local Maven repo — do this **once** (and again after changing `mcp-ratelimit`):
+```bash
+mvn -pl mcp-ratelimit -am install -DskipTests
+```
+
+> `mcp-agent`'s Karate test (`KarateApiTest`) was already failing before the multi-module change, so a
+> full-reactor `mvn test` reports `mcp-agent` as failed. Use `--fail-at-end` to see every module's result.
 
 ---
 
@@ -185,7 +212,7 @@ No changes to `mcp-agent` Java code. Tools are discovered automatically at start
   Formula `A = P·(1 + r/(100·n))^(n·t)`; `years × compoundsPerYear` must be a whole number.
   Employee salary is the principal; rate, years and compounds/year come from the user prompt.
 - **Rate limit** — `employee-mcp` and `finance-mcp` each enforce **one shared limit of 100 calls/sec
-  across all their tools** (strict sliding 1s window, `mcp.rate-limit.requests-per-second`).
+  across all their tools** (Bucket4j token bucket: capacity = refill = 100/s, bursts allowed; `mcp.rate-limit.requests-per-second`).
   Excess calls return a tool error (`isError: true`, "Rate limit exceeded…").
 
 ### Security model
@@ -205,8 +232,9 @@ export AGENT_SHARED_API_KEY='a-long-random-value'   # set in BOTH terminals befo
 
 **Unit tests**
 ```bash
-cd employee-mcp   && mvn test    # search filters, 100 RPS limiter
-cd finance-mcp    && mvn test    # compound interest, batch, limiter
+cd mcp-ratelimit  && mvn test    # token bucket (burst/refill) + auto-configuration
+cd employee-mcp   && mvn test    # search filters
+cd finance-mcp    && mvn test    # compound interest, batch
 cd employee-agent && mvn test    # API-key filter (401 / pass-through)
 ```
 
@@ -261,14 +289,14 @@ curl -s -H "$H1" -H "$H2" -H "Mcp-Session-Id: $S" localhost:8085/mcp \
 
 **3. Rate limit (100 RPS across all tools)**
 
-With the session `$S` from above, fire 300 calls in parallel against `employee-mcp`; within one second
-exactly 100 succeed and the rest are rejected:
+With the session `$S` from above, fire 300 calls in parallel against `employee-mcp`; the first 100 succeed
+immediately (the burst) and the rest are rejected, apart from tokens refilled while the burst runs:
 ```bash
 seq 1 300 | xargs -P 50 -I{} curl -s -H "$H1" -H "$H2" -H "Mcp-Session-Id: $S" localhost:8085/mcp \
   -d '{"jsonrpc":"2.0","id":{},"method":"tools/call","params":{"name":"get_employee_details","arguments":{"employeeId":"E001"}}}' \
   | grep -o '"isError":[a-z]*' | sort | uniq -c
-#  100 "isError":false
-#  200 "isError":true      (≈ — depends on how long the burst takes; the cap is per 1s window)
+#  ~120 "isError":false    (100 burst + ~100 tokens/s refilled while the burst ran; observed 122)
+#  ~180 "isError":true
 ```
 Same approach works on `finance-mcp` (:8082) with `calculate_compound_interest`. Change the limit with
 `--mcp.rate-limit.requests-per-second=N`.

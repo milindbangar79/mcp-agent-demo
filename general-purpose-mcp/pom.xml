@@ -14,36 +14,17 @@
     the public parent (per java-spring-conventions skill).
   -->
   <parent>
-    <groupId>org.springframework.boot</groupId>
-    <artifactId>spring-boot-starter-parent</artifactId>
-    <version>4.1.1</version>
-    <relativePath/> <!-- lookup parent from repository -->
+    <groupId>com.milind</groupId>
+    <artifactId>mcp-agent-demo</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+    <relativePath>../pom.xml</relativePath>
   </parent>
 
-  <groupId>com.milind</groupId>
   <artifactId>general-purpose-mcp</artifactId>
-  <version>0.1.0-SNAPSHOT</version>
   <name>general-purpose-mcp</name>
   <description>General-purpose MCP server exposing greeting and simple-interest tools over Streamable HTTP</description>
 
-  <properties>
-    <java.version>21</java.version>
-    <!-- Spring AI is NOT pinned by the internal parent (yet), so the BOM import
-         below is legitimate. If the parent later pins Spring AI, remove this. -->
-    <spring-ai.version>2.0.1</spring-ai.version>
-  </properties>
 
-  <dependencyManagement>
-    <dependencies>
-      <dependency>
-        <groupId>org.springframework.ai</groupId>
-        <artifactId>spring-ai-bom</artifactId>
-        <version>${spring-ai.version}</version>
-        <type>pom</type>
-        <scope>import</scope>
-      </dependency>
-    </dependencies>
-  </dependencyManagement>
 
   <dependencies>
     <dependency>

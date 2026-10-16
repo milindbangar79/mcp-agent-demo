@@ -7,7 +7,7 @@ import java.util.List;
 import com.milind.employeemcp.domain.Employee;
 import com.milind.employeemcp.domain.EmployeeService;
 import com.milind.employeemcp.domain.EmployeeService.SearchCriteria;
-import com.milind.employeemcp.ratelimit.SlidingWindowRateLimiter;
+import com.milind.mcpratelimit.ToolRateLimiter;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -21,9 +21,9 @@ public class EmployeeMcpTools {
     private static final Logger log = LoggerFactory.getLogger(EmployeeMcpTools.class);
 
     private final EmployeeService service;
-    private final SlidingWindowRateLimiter rateLimiter;
+    private final ToolRateLimiter rateLimiter;
 
-    public EmployeeMcpTools(EmployeeService service, SlidingWindowRateLimiter rateLimiter) {
+    public EmployeeMcpTools(EmployeeService service, ToolRateLimiter rateLimiter) {
         this.service = service;
         this.rateLimiter = rateLimiter;
     }
