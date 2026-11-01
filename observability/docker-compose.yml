@@ -1,0 +1,35 @@
+# Local telemetry stack. Start:  docker compose -f observability/docker-compose.yml up -d
+#   Grafana (traces/logs/metrics) http://localhost:3000   (admin / admin)
+#   OTLP in                       http://localhost:4318 (HTTP) / localhost:4317 (gRPC)
+#   Audit DB                      localhost:5432  db=audit
+# Dev credentials only.
+services:
+  lgtm:
+    # One container with OTel Collector + Tempo (traces) + Loki (logs) + Prometheus (metrics) + Grafana.
+    image: grafana/otel-lgtm:0.39.0
+    # Pinned to amd64: on an Apple Silicon Mac the arm64 variant of this tag failed to start here
+    # ("exec format error"), and it runs fine under Docker Desktop's emulation. Native on x86 hosts.
+    platform: linux/amd64
+    ports:
+      - "3000:3000"
+      - "4317:4317"
+      - "4318:4318"
+    volumes:
+      # Provisions the "MCP Agent Demo" dashboards (see docs/TELEMETRY.md)
+      - ./grafana/provisioning-dashboards.yaml:/otel-lgtm/grafana/conf/provisioning/dashboards/mcp-agent.yaml:ro
+      - ./grafana/dashboards:/otel-lgtm/mcp-agent-dashboards:ro
+
+  audit-db:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: audit
+      POSTGRES_USER: audit_admin
+      POSTGRES_PASSWORD: audit_admin_dev
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./postgres-init:/docker-entrypoint-initdb.d:ro
+      - audit-data:/var/lib/postgresql/data
+
+volumes:
+  audit-data:

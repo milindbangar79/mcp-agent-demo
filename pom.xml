@@ -23,6 +23,7 @@
 
   <modules>
     <module>mcp-ratelimit</module>
+    <module>mcp-observability</module>
     <module>finance-mcp</module>
     <module>research-mcp</module>
     <module>comms-mcp</module>
@@ -36,6 +37,8 @@
     <java.version>21</java.version>
     <spring-ai.version>2.0.1</spring-ai.version>
     <bucket4j.version>8.21.0</bucket4j.version>
+    <!-- Must track the OpenTelemetry core version that Spring Boot manages (1.62.x -> instrumentation 2.28.x) -->
+    <otel-logback-appender.version>2.28.1-alpha</otel-logback-appender.version>
   </properties>
 
   <dependencyManagement>
@@ -52,10 +55,20 @@
         <artifactId>bucket4j_jdk17-core</artifactId>
         <version>${bucket4j.version}</version>
       </dependency>
+      <dependency>
+        <groupId>io.opentelemetry.instrumentation</groupId>
+        <artifactId>opentelemetry-logback-appender-1.0</artifactId>
+        <version>${otel-logback-appender.version}</version>
+      </dependency>
       <!-- Internal shared library -->
       <dependency>
         <groupId>com.milind</groupId>
         <artifactId>mcp-ratelimit</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>com.milind</groupId>
+        <artifactId>mcp-observability</artifactId>
         <version>${project.version}</version>
       </dependency>
     </dependencies>
