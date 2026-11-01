@@ -18,6 +18,11 @@
 
 
   <dependencies>
+    <!-- Telemetry: OTLP traces/metrics/logs + LLM/MCP audit trail -->
+    <dependency>
+      <groupId>com.milind</groupId>
+      <artifactId>mcp-observability</artifactId>
+    </dependency>
     <!-- Shared tool-level rate limiting (auto-configured; mcp.rate-limit.requests-per-second) -->
     <dependency>
       <groupId>com.milind</groupId>

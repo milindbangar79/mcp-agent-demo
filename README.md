@@ -58,6 +58,7 @@ one YAML entry in `mcp-agent`. No agent code changes.
 | `employee-mcp` | 8085 | Employee Skill: `get_employee_details`, `search_employees` (100 RPS shared limit) |
 | `employee-agent` | 8086 | Agent called by mcp-agent (REST, `X-API-Key` secured); uses employee-mcp |
 | `mcp-ratelimit` | — | Shared library: Bucket4j tool-level rate limiter + Spring Boot auto-configuration (used by `finance-mcp`, `employee-mcp`) |
+| `mcp-observability` | — | Shared library: OpenTelemetry traces/metrics/logs + LLM and MCP-tool audit trail (log + hash-chained Postgres). Used by every module except `general-purpose-mcp` |
 | `general-purpose-mcp` | 8081 | Legacy — superseded by the three skill servers above |
 
 ---
@@ -82,7 +83,7 @@ one YAML entry in `mcp-agent`. No agent code changes.
 ## Build
 
 The repo is a Maven **multi-module project**: the root `pom.xml` (`com.milind:mcp-agent-demo`) is the
-parent/aggregator for `mcp-ratelimit` and all seven apps. It extends `spring-boot-starter-parent`, and
+parent/aggregator for the two shared libraries (`mcp-ratelimit`, `mcp-observability`) and all seven apps. It extends `spring-boot-starter-parent`, and
 centrally manages the Spring AI BOM, Bucket4j and the internal `mcp-ratelimit` version.
 
 ```bash
@@ -92,10 +93,10 @@ mvn test -Dskip.npm -Dskip.installnodenpm
 mvn test -pl finance-mcp -am
 ```
 
-Running a single app with `cd <module> && mvn spring-boot:run` needs the parent and `mcp-ratelimit`
-in your local Maven repo — do this **once** (and again after changing `mcp-ratelimit`):
+Running a single app with `cd <module> && mvn spring-boot:run` needs the parent and the two shared
+libraries in your local Maven repo — do this **once** (and again after changing the root `pom.xml` or either library):
 ```bash
-mvn -pl mcp-ratelimit -am install -DskipTests
+mvn -pl mcp-observability -am install -DskipTests   # root pom + mcp-ratelimit + mcp-observability
 ```
 
 > `mcp-agent`'s Karate test (`KarateApiTest`) was already failing before the multi-module change, so a
@@ -300,3 +301,96 @@ seq 1 300 | xargs -P 50 -I{} curl -s -H "$H1" -H "$H2" -H "Mcp-Session-Id: $S" l
 ```
 Same approach works on `finance-mcp` (:8082) with `calculate_compound_interest`. Change the limit with
 `--mcp.rate-limit.requests-per-second=N`.
+
+---
+
+## Observability & audit
+
+Every service exports **traces, metrics and logs over OTLP** and writes an **audit trail** of the LLM and
+tool flow. Design, signals and limits: [ARCHITECTURE.md §11](./ARCHITECTURE.md#11-observability--audit). **Full guide with the signal catalogue, dashboard and a what-to-look-for playbook: [docs/TELEMETRY.md](./docs/TELEMETRY.md).**
+
+### Start the local stack
+
+```bash
+docker compose -f observability/docker-compose.yml up -d
+```
+| What | Where |
+|---|---|
+| Grafana (Tempo traces, Loki logs, Prometheus metrics) | http://localhost:3000 (admin / admin) |
+| OTLP receiver (services export here by default) | http://localhost:4318 |
+| Audit database (Postgres, db `audit`) | `localhost:5432` |
+
+> The `grafana/otel-lgtm` image is pinned to `linux/amd64` in the compose file: the arm64 variant of this tag
+> would not start on an Apple Silicon Mac (`exec format error`). It runs under Docker Desktop's emulation.
+
+Then start the services exactly as in [Run](#run). Nothing else is needed for traces, metrics and logs:
+they export to `localhost:4318` automatically (override with `OTLP_ENDPOINT`). If the stack is down the
+services still work; the exporters just log a warning.
+
+### Turn on the compliance audit store (Postgres)
+
+Off by default so the apps start without a database. Set this **in every terminal** before starting:
+```bash
+export AUDIT_JDBC_ENABLED=true
+# optional overrides: AUDIT_JDBC_URL, AUDIT_JDBC_USER, AUDIT_JDBC_PASSWORD (dev defaults match the compose file)
+```
+Prompts, completions and tool arguments/results are stored in full by default (dev). To store only a SHA-256
+and length instead: `export AUDIT_CONTENT=redacted`. **Both sinks hold PII (names, dates of birth, salaries)
+in `full` mode.** Spans and metrics never carry content in either mode.
+
+### Dashboard
+
+The stack provisions **"MCP Agent Demo - Telemetry"** automatically: http://localhost:3000/d/mcp-agent-telemetry
+(tokens, LLM latency, tool outcomes, rate-limit share, agent auth, audit events, recent traces). To fill it with
+realistic traffic (chats, wrong-key 401s, tool errors, two rate-limit bursts):
+```bash
+observability/load/generate-load.sh        # ~5 minutes; set AGENT_URL etc. if you use non-default ports
+```
+Panel-by-panel explanation, sample graphs and a symptom → where-to-look table are in
+[docs/TELEMETRY.md](./docs/TELEMETRY.md#5-the-dashboard).
+
+### See one request end to end
+
+Send a chat that crosses all hops, for example:
+```bash
+curl -s -X POST http://localhost:8080/api/agent/chat -H 'Content-Type: application/json' \
+  -d '{"prompt": "Delegate to the employee agent: list the employees in India"}' | jq
+```
+In Grafana → **Explore**:
+
+| Datasource | Query | Shows |
+|---|---|---|
+| Tempo (TraceQL) | `{ resource.service.name = "mcp-agent" }` → open a trace | One trace across `mcp-agent` → `employee-agent` → `employee-mcp` (and `finance-mcp`), including each model call and tool call |
+| Loki (LogQL) | `{service_name=~".+"} \| scope_name="mcp.audit" \| json \| event_type="llm.call"` | Full prompt/completion per model round-trip (dev). Swap the event type for `llm.tool.call`, `mcp.tool.invoke`, `agent.request` |
+| Loki | `{service_name=~".+"} \| trace_id="<id>"` | Every log line of one request (the trace id is also in the console log pattern) |
+| Prometheus (PromQL) | `sum by (service_name, gen_ai_token_type) (gen_ai_client_token_usage_total)` | Token usage per service (cost) |
+| Prometheus | `sum by (mcp_tool, outcome) (mcp_tool_call_milliseconds_count)` | Tool calls per outcome: `success`, `error`, `rate_limited` |
+| Prometheus | `sum by (outcome) (agent_auth_total)` | Agent-to-agent auth: `accepted` / `rejected` (401) |
+
+### Query and verify the audit trail
+
+```bash
+# everything that happened for one trace, in order
+docker exec -it observability-audit-db-1 psql -U audit_admin -d audit -c \
+  "select seq, service, event_type, resource, outcome, duration_ms from audit_event where trace_id='<trace id>' order by seq"
+
+# rate-limit rejections
+docker exec -it observability-audit-db-1 psql -U audit_admin -d audit -c \
+  "select ts, service, resource from audit_event where outcome='rate_limited' order by seq desc limit 10"
+```
+Each row is chained to the previous one by hash, `UPDATE`/`DELETE`/`TRUNCATE` are blocked by triggers, and the
+services connect as a role that can only `INSERT`/`SELECT`. To verify the chain from a running service, expose
+the endpoint and call it (it scans the whole table, so keep it off by default):
+```bash
+cd employee-agent && mvn spring-boot:run -Dspring-boot.run.arguments=--management.endpoints.web.exposure.include=health,auditchain
+curl -s localhost:8086/actuator/auditchain
+# {"valid":true,"checkedRows":8,"firstBrokenSeq":null,"reason":null}
+```
+After a row is edited by someone with database superuser rights, the same call returns
+`{"valid":false,"firstBrokenSeq":4,"reason":"row content does not match its hash"}`.
+
+### Tests
+
+```bash
+mvn test -pl mcp-observability     # hash chain (tamper/delete/empty), content policy, MCP tool aspect outcomes
+```

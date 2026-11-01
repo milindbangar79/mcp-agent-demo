@@ -19,10 +19,11 @@
 8. [Multi-Agent Design (employee-agent)](#8-multi-agent-design-employee-agent)
 9. [Security](#9-security)
 10. [Rate Limiting](#10-rate-limiting)
-11. [Technology Stack](#11-technology-stack)
-12. [Running the System](#12-running-the-system)
-13. [Design Decisions](#13-design-decisions)
-14. [Roadmap](#14-roadmap)
+11. [Observability & Audit](#11-observability--audit)
+12. [Technology Stack](#12-technology-stack)
+13. [Running the System](#13-running-the-system)
+14. [Design Decisions](#14-design-decisions)
+15. [Roadmap](#15-roadmap)
 
 ---
 
@@ -288,23 +289,43 @@ per application) and each tool method calls `acquireOrThrow()` first. Defining y
 
 ---
 
-### 3.8 `general-purpose-mcp` — Legacy (port 8081)
+### 3.8 `mcp-observability` — Shared telemetry and audit library
+
+A Spring Boot auto-configuration library (no `main`), added to every module except `general-purpose-mcp`.
+One dependency brings actuator, OTLP export for traces/metrics/logs, and the capture points described in §11:
+
+| Class | Role |
+|---|---|
+| `McpToolAuditAspect` | MCP servers: span + timer + audit event around every `@McpTool` |
+| `LlmAuditObservationHandlers` | Agents: audit event per model round-trip and per tool call |
+| `TraceContextClientCustomizer` / `TraceparentRequestCustomizer` | Agents: carry `traceparent` into MCP requests |
+| `AuditRecorder` | Applies the content policy, fills trace ids, fans out to the sinks |
+| `LogAuditSink` / `JdbcAuditSink` | Loki (dev) / hash-chained Postgres (compliance) |
+| `AuditChain`, `AuditChainEndpoint` | Hash chain and its verification (`/actuator/auditchain`) |
+
+Each capture point is guarded by `@ConditionalOnClass`, so MCP servers get the aspect, agents get the LLM
+handlers and MCP propagation, and a module only pays for what it uses. Settings: `mcp.audit.*` (§11.5, §11.6).
+
+### 3.9 `general-purpose-mcp` — Legacy (port 8081)
 
 The original single server that held all three tools before the skill split. It is
 no longer connected to `mcp-agent` (the YAML connections now point to the three
 skill servers). Kept for reference; safe to delete once the three skill servers are
 confirmed stable.
 
-### 3.9 Maven layout (multi-module)
+### 3.10 Maven layout (multi-module)
 
 ```
 mcp-agent-demo/                (root pom: com.milind:mcp-agent-demo, packaging=pom)
 ├── pom.xml                    ← parent: spring-boot-starter-parent 4.1.1; manages Spring AI BOM,
 │                                 Bucket4j and mcp-ratelimit versions; lists <modules>
 ├── mcp-ratelimit/             ← library (auto-configuration)
-├── finance-mcp/  employee-mcp/            ← depend on mcp-ratelimit
-├── research-mcp/ comms-mcp/ general-purpose-mcp/
-├── employee-agent/ mcp-agent/
+├── mcp-observability/         ← library (auto-configuration); depends on mcp-ratelimit
+├── finance-mcp/  employee-mcp/            ← depend on mcp-ratelimit and mcp-observability
+├── research-mcp/ comms-mcp/               ← depend on mcp-observability
+├── employee-agent/ mcp-agent/             ← depend on mcp-observability
+├── general-purpose-mcp/       ← legacy, not instrumented
+└── observability/             ← docker-compose (Grafana LGTM + Postgres) and the audit-table SQL
 ```
 
 Modules inherit `groupId` (`com.milind`) and `version` from the root. Only Maven coordinates were
@@ -808,7 +829,192 @@ Recommended layering for deployment: a coarse per-client limit at the gateway/in
 
 ---
 
-## 11. Technology Stack
+## 11. Observability & Audit
+
+> **Full guide:** [docs/TELEMETRY.md](./docs/TELEMETRY.md) covers the design, implementation, the complete
+> metric/trace/log/audit catalogue, the provisioned Grafana dashboard with sample graphs, a "what to look for"
+> playbook, query cookbook and troubleshooting. This section is the architectural summary.
+
+### 11.1 Goals and scope
+
+Two different needs, served by two different mechanisms:
+
+| Need | Served by | Properties |
+|---|---|---|
+| **Developer debugging**: "what did the model and the tools do for this request, and why was it slow or wrong?" | OpenTelemetry **traces, metrics and logs** → Grafana (Tempo, Prometheus, Loki) | Sampled, lossy, short retention. Never holds prompt/completion text |
+| **Compliance audit**: "who/what accessed which data through which model call, and has the record been altered?" | **Audit events** → Postgres (hash-chained, append-only) and, for dev, Loki | Unsampled, durable, tamper-evident. Holds content per the content policy |
+
+Everything lives in one shared library, `mcp-observability` (§3.8), added to every module except the
+legacy `general-purpose-mcp`. It is starter-like: a service adds one dependency and gets actuator, OTLP export
+and the capture points below.
+
+### 11.2 Architecture
+
+```
+ browser ─▶ mcp-agent ──REST+X-API-Key──▶ employee-agent
+              │  │                              │
+              │  └──MCP (Streamable HTTP)──▶ finance/research/comms-mcp
+              └─────MCP──────────────────▶ employee-mcp ◀──MCP── employee-agent
+                       every arrow carries a W3C `traceparent`
+   ┌──────────────────────────── each service (mcp-observability) ─────────────────────────────┐
+   │ Spring AI / MVC observations ─┐                                                           │
+   │ ObservationHandlers (LLM,tool)├─▶ AuditRecorder ─▶ LogAuditSink  ──▶ logger "mcp.audit" ──┼─▶ OTLP logs
+   │ @McpTool aspect               │   (content policy)  JdbcAuditSink ──▶ Postgres audit_event │
+   │ ApiKeyFilter                  ┘                                                           │
+   │ OTLP exporters: traces, metrics, logs ───────────────────────────────────────────────────┼─▶ :4318
+   └───────────────────────────────────────────────────────────────────────────────────────────┘
+        :4318 ▶ OTel Collector ▶ Tempo (traces) · Prometheus (metrics) · Loki (logs) ▶ Grafana :3000
+```
+The local stack is `observability/docker-compose.yml` (`grafana/otel-lgtm` + Postgres).
+
+### 11.3 Signals
+
+**Traces** (one trace per user question, spanning all services; verified, see §11.7)
+
+| Span | From | Notes |
+|---|---|---|
+| `http post /api/agent/chat`, `http post /mcp`, `http post /api/employee/ask` | Spring MVC | Server spans; join the caller's trace through `traceparent` |
+| `spring_ai chat_client`, `tool _calling`, `chat <model>` | Spring AI | `gen_ai.*` attributes: model, temperature, finish reason, input/output tokens, tool names |
+| `execute_tool <name>` | Spring AI | Every tool the model invoked: local `@Tool` (`ask_employee_agent`) and MCP-discovered |
+| `mcp.tool <name>` | `McpToolAuditAspect` | Server-side span for each `@McpTool`, tagged `outcome` |
+
+**Metrics**
+
+| Metric (Prometheus name) | Labels | Answers |
+|---|---|---|
+| `gen_ai_client_token_usage_total` | service, model, `gen_ai_token_type` (input/output/total) | Cost per service/model |
+| `gen_ai_client_operation_milliseconds_*` | service, model | LLM latency |
+| `spring_ai_tool_milliseconds_*` | tool | Tool latency/rate as the model sees them |
+| `mcp_tool_call_milliseconds_*` | `mcp_tool`, `mcp_server`, `outcome` = `success`/`error`/`rate_limited` | Server-side tool load, errors and **rate-limit rejections** |
+| `agent_auth_total` | `outcome` = `accepted`/`rejected` | Agent-to-agent auth failures (401s) |
+
+**Audit events** (`event_type`): each carries `trace_id`, `span_id`, `service`, `actor`, `resource`,
+`outcome`, `duration_ms` and an attribute payload.
+
+| Event | Written by | Key attributes |
+|---|---|---|
+| `llm.call` | Chat observation handler (one per model round-trip) | `prompt` (all messages), `completion`, `requestedToolCalls`, `inputTokens`, `outputTokens`, `finishReason`, `provider` |
+| `llm.tool.call` | Tool observation handler | `arguments`, `result`, `toolCallId`; `outcome` = `success` / `error` / `tool_error` (see below) |
+| `mcp.tool.invoke` | `@McpTool` aspect (MCP servers) | `arguments`, `result`, `errorType`/`errorMessage`; `outcome` = `success`/`error`/`rate_limited` |
+| `agent.request` | `ApiKeyFilter` (employee-agent) | `outcome` = `accepted`/`rejected`, method + path, `remoteAddr` |
+
+### 11.4 How each signal is captured
+
+- **Spring AI instruments the LLM flow itself** (`ChatClient`, model call, tool call observations) once an
+  `ObservationRegistry` and a tracer are present. Two small `ObservationHandler`s
+  (`LlmAuditObservationHandlers`) read the finished observation contexts, which carry the full prompt, response
+  and tool payloads, and turn them into audit events. The trace id is read from the `TracingContext` Micrometer
+  stores on the observation, so audit rows join to the right trace.
+- **MCP servers** have no Spring AI instrumentation, so `McpToolAuditAspect` wraps every `@McpTool` method. It
+  creates the span and timer, classifies the outcome (`RateLimitExceededException` → `rate_limited`), and
+  writes the audit event. It runs around the tool method, so a rate-limit rejection thrown by
+  `acquireOrThrow()` is captured. Verified: Spring AI's `@McpTool` discovery still works with the aspect
+  (both tools are listed and callable).
+- **Context propagation**
+  - *REST hop* (`mcp-agent` → `employee-agent`): `EmployeeAgentTools` builds its client from Spring's
+    `RestClient.Builder`, which is instrumented, so `traceparent` is sent. Nothing extra needed.
+  - *MCP hops*: the MCP client uses the JDK `HttpClient`, which Spring does not instrument. Reading the current
+    span inside the SDK's request customizer **did not work** (the request is built on a Reactor thread with no
+    span; this was observed, not assumed: the MCP server started a different trace). The fix is a pair:
+    `TraceContextClientCustomizer` sets the SDK's `transportContextProvider`, which *is* evaluated on the calling
+    thread, and captures the `traceparent` there; `TraceparentRequestCustomizer` copies it onto the HTTP request.
+    This relies on the SYNC client (the calling thread must be the one holding the span).
+  - *Server side*: Spring MVC extracts `traceparent` automatically.
+- **Logs**: a bundled `logback-spring.xml` adds the OpenTelemetry Logback appender next to the console appender;
+  `ObservabilityAutoConfiguration` attaches it to the SDK at startup. Log lines carry `trace_id`/`span_id`
+  (Loki structured metadata) and the console pattern shows the trace id. A service that ships its own
+  `logback-spring.xml` overrides this.
+- **MCP tool errors are invisible to the span.** Spring AI's MCP tool callback does not throw when an MCP server
+  returns an error result (invalid arguments, a rate-limit rejection): it hands the model the string
+  `Error calling tool: ...`. The `execute_tool` span therefore ends `OK`. Observed: a schema-invalid
+  `calculate_compound_interest_batch` call produced a green span. The audit event is flagged
+  `outcome = tool_error` by a prefix check on that string (brittle if Spring AI changes the wording). The span
+  and the `spring_ai_tool_*` metric still show success; the server-side `mcp_tool_call_*` metric
+  (`outcome="error"` / `"rate_limited"`) is the reliable error signal for MCP tools.
+- **Agent auth**: `ApiKeyFilter` records every request, accepted or rejected, as an `agent.request` event and an
+  `agent_auth_total` counter. Failures here are logged and never block the request.
+
+### 11.5 Content policy: where prompt and data text may live
+
+| Where | Prompt / completion / tool args+results |
+|---|---|
+| Traces (Tempo) and metrics | **Never.** Spring AI's content flags are set to `false` explicitly (`spring.ai.chat.observations.log-prompt`, `log-completion`, `spring.ai.tools.observations.include-content`). Checked on a real trace: employee names and salaries do not appear in any span attribute |
+| Audit sinks (Loki line, Postgres row) | Per `mcp.audit.content`: `full` (default, dev) stores the text, truncated at `mcp.audit.max-content-chars` (20 000) with a `…Truncated` flag; `redacted` stores only `…Sha256` and `…Chars` |
+| Application logs | `org.springframework.ai` and `io.modelcontextprotocol` are now at `INFO` in `mcp-agent`. They were `DEBUG`, which prints full payloads to the console and, with OTLP logs on, to Loki, bypassing this policy |
+
+The audit sinks are therefore the only place sensitive text lands. In `full` mode they hold names, dates of
+birth and salaries: treat Loki and the audit database as PII stores (access control, retention).
+
+### 11.6 The audit store
+
+Schema: `observability/postgres-init/001-audit.sql`. Table `audit_event(seq, id, ts, service, event_type,
+trace_id, span_id, actor, resource, outcome, duration_ms, payload, prev_hash, hash)`.
+
+- **Hash chain.** `hash = SHA-256(prev_hash ‖ id ‖ ts ‖ service ‖ event_type ‖ trace_id ‖ span_id ‖ actor ‖
+  resource ‖ outcome ‖ duration_ms ‖ payload)` (`AuditChain`). Editing, deleting or reordering a row breaks
+  every later hash. Timestamps are truncated to microseconds before hashing because Postgres stores
+  microseconds and the chain must survive a round trip.
+- **One chain, many writers.** All services append to the same table. Each insert takes a transaction-scoped
+  advisory lock (`pg_advisory_xact_lock`), reads the last hash, and inserts, so the chain stays linear across JVMs.
+  The cost is that audit writes are serialised: fine at demo scale, a bottleneck at high write rates.
+- **Append-only in the database.** Triggers raise on `UPDATE`, `DELETE` and `TRUNCATE`; the services connect as
+  `audit_writer`, which has only `INSERT` and `SELECT`.
+- **Verification.** `AuditChain.verify` replays the table. Exposed as the actuator endpoint
+  `GET /actuator/auditchain` (not exposed by default; O(n)). Returns the first broken `seq`.
+- **No DDL from the apps.** The services never create the table; the SQL is applied by the compose init script
+  (dev) or a DBA (real environments).
+
+### 11.7 Verified behaviour
+
+Run against the real stack with `llama3.1:8b`, the Grafana LGTM image and Postgres 17:
+
+| Check | Result |
+|---|---|
+| One user question across `mcp-agent` → `employee-agent` → `employee-mcp` → `finance-mcp` | **One trace id** end to end, with the model calls, `execute_tool` spans and the server-side `mcp.tool` span nested correctly |
+| Same check **before** the propagation fix | The MCP server's span had a different trace id (the failure described in §11.4) |
+| Content in spans | No employee names or salary values in any span attribute |
+| Loki | Audit lines queryable by `scope_name="mcp.audit"`; `llm.call` shows the full prompt and completion in `full` mode |
+| Prometheus | `gen_ai_client_token_usage_total`, `mcp_tool_call_milliseconds_*`, `agent_auth_total` present |
+| Postgres, 3 JVMs writing | A single linear chain of 8 rows for one request; `/actuator/auditchain` → `valid: true` |
+| `UPDATE` as owner / `DELETE` as writer | Blocked (`audit_event is append-only` / `permission denied`) |
+| Edit a row with the trigger disabled by a superuser | `valid: false`, `firstBrokenSeq` = the edited row |
+| 300 parallel tool calls vs the 100 RPS limit | 153 `success`, 147 `rate_limited` audited, error text recorded |
+| Failure visibility | A malformed `calculate_compound_interest_batch` call by the model (`items` sent as a string): the HTTP response was 200 and the span was `OK`. The error showed up in the Loki log (`Error calling tool: ...`) and in the audit `result` text. Before the `tool_error` check was added the audit outcome also read `success`; the check was added after this run and is covered by a unit test only, not re-run end to end |
+
+Unit tests (`mcp-observability`, 15): hash chain intact / edited / deleted / empty; content policy full,
+truncated, redacted; a failing sink does not break the caller; timestamp precision; tool-error classification; aspect outcomes
+(`success`, `rate_limited`, `error`) in both the timer and the audit event.
+
+### 11.8 Limitations and open items
+
+- **No end-user identity.** `mcp-agent` has no authentication, so `actor` is `anonymous` for model and tool
+  events and `shared-key-client` / `unauthenticated` for the agent hop. A compliance trail that must say *who
+  asked* needs real user auth propagated through the agents (for example a JWT subject carried as baggage).
+- **Fail-open.** If a sink fails, the error is logged and the request proceeds. For a fail-closed posture,
+  `AuditRecorder` is the one place to change.
+- **Tamper evidence has limits.** A database superuser can disable the triggers and rewrite *and re-hash* the
+  tail; truncating the newest rows is only detectable against an externally anchored latest hash. Real
+  deployments should periodically anchor the head hash in WORM storage or a separate system.
+- **Synchronous writes** in the request path (see the serialisation note in §11.6).
+- **Sampling is 100 %** (`management.tracing.sampling.probability: 1.0`). In production, keep traces by tail
+  sampling in the collector (all errors, rate-limit hits, slow or high-token traces) rather than head sampling.
+- **Not yet built:** Grafana dashboards and alerts; a "tool calls per question" or "iterations per question"
+  metric (derivable from traces, for example with Tempo metrics-generator); alerting on tokens per question.
+- **Coverage:** `general-purpose-mcp` (legacy) is not instrumented. Metrics are exported every 10 s.
+- **MCP propagation depends on the SYNC client.** Switching `spring.ai.mcp.client.type` to ASYNC would need the
+  context to travel via the Reactor context instead.
+- **Local image note:** `grafana/otel-lgtm:0.39.0` is pinned to `linux/amd64` in the compose file (see README).
+
+### 11.9 What this does not cover: evaluation
+
+Telemetry shows what happened in production; it does not say whether a prompt change made things better. The
+traced run in §11.7 already shows why that matters: the model produced a schema-invalid tool call, and the
+only symptoms were a wrong answer behind a 200 and a green span. A prompt/tool-description regression suite (deterministic
+tool-call assertions in CI, an LLM judge nightly, cases harvested from real traces) is the planned next step.
+
+---
+
+## 12. Technology Stack
 
 | Layer | Technology | Version | Why |
 |---|---|---|---|
@@ -823,10 +1029,13 @@ Recommended layering for deployment: a coarse per-client limit at the gateway/in
 | UI design system | Salt DS (JP Morgan) | 1.67.0 | Production-grade components, built-in light/dark mode |
 | Frontend–Maven bridge | frontend-maven-plugin | 1.15.0 | Single `mvn package` builds both Java and React |
 | Arithmetic | `java.math.BigDecimal` | — | Exact decimal arithmetic for financial values |
+| Telemetry | Micrometer Observation + Tracing, OpenTelemetry SDK (OTLP) | Boot-managed (1.62) | Vendor-neutral; Spring AI already emits GenAI observations |
+| Telemetry backend (local) | Grafana LGTM (Tempo, Loki, Prometheus, Grafana) | 0.39.0 | One container for all three signals |
+| Audit store | PostgreSQL | 17 | Append-only triggers, advisory lock for a single hash chain |
 
 ---
 
-## 12. Running the System
+## 13. Running the System
 
 ### Port assignments
 
@@ -839,6 +1048,8 @@ Recommended layering for deployment: a coarse per-client limit at the gateway/in
 | `comms-mcp` | 8084 | Communication Skill MCP server |
 | `employee-mcp` | 8085 | Employee Skill MCP server (100 RPS cap) |
 | `employee-agent` | 8086 | Peer agent, REST `/api/employee/ask` (X-API-Key) |
+| Grafana LGTM | 3000 (UI), 4317/4318 (OTLP) | Traces, logs, metrics (`observability/docker-compose.yml`) |
+| Audit database (Postgres) | 5432 | `audit_event` hash-chained table |
 | React dev server | 5173 | Development only (proxies /api → :8080) |
 
 ### Startup order
@@ -880,7 +1091,7 @@ npm run dev               # → http://localhost:5173 (hot reload, proxies /api)
 
 ---
 
-## 13. Design Decisions
+## 14. Design Decisions
 
 ### Why MCP instead of direct REST calls between services?
 
@@ -932,6 +1143,25 @@ environments will run several instances, we moved to Bucket4j: a maintained, loc
 bucket whose Redis/JCache/Hazelcast backends give a cluster-wide limit without changing the tool
 code. The trade-off, accepted explicitly, is burst semantics instead of a strict per-second ceiling.
 
+### Why two telemetry paths (OTLP and an audit table) instead of one?
+
+Traces and logs are sampled, mutable and short-lived, which is right for debugging and wrong for compliance;
+an audit record must be unsampled, durable and tamper-evident. The audit events also carry the sensitive text
+(prompts, tool results) that must be kept out of spans and metrics. So the same event is written to Loki for
+developers and to an append-only, hash-chained table for audit, with one content policy applied before both.
+
+### Why hook Spring AI's observations rather than wrap the ChatClient?
+
+Spring AI already emits a span per model call and per tool call, including inside the tool-calling loop where a
+`ChatClient` advisor would only see the outer call. Handlers on those observations see every round-trip, with
+the prompt and response, and need no change to the agents' code.
+
+### Why an aspect on `@McpTool` instead of calling the auditor inside each tool?
+
+The tool methods already call the rate limiter by hand; adding a second hand-written call per tool is how a
+tool ends up unaudited. The aspect covers every current and future tool, and sees the outcome (including the
+rate-limit exception) that an in-method call cannot.
+
 ### Why a batch compound-interest tool?
 
 "A bunch of employees" would otherwise be N finance calls, N LLM round-trips and N rate-limit
@@ -962,7 +1192,7 @@ the tool result is correct but the LLM's response silently drops data.
 
 ---
 
-## 14. Roadmap
+## 15. Roadmap
 
 The following are natural next steps, in rough priority order.
 
@@ -983,6 +1213,12 @@ Extend existing skill servers with more tools:
 
 Signed JWT or mTLS between agents, TLS everywhere, authenticated MCP servers, per-client
 quotas, and a shared (cluster-wide) limiter.
+
+### Observability & evaluation (see §11.8, §11.9)
+
+Dashboards and alerts on the new metrics, tail sampling in the collector, end-user identity propagated through
+the agents for the audit `actor`, an external anchor for the audit head hash, and the prompt / tool-description
+regression suite (deterministic tool-call assertions in CI, an LLM judge nightly).
 
 ### Layer 3 — Sub-agents (first one done; router still open)
 

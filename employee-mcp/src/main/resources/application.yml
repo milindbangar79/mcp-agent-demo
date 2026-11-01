@@ -21,8 +21,48 @@ mcp:
   rate-limit:
     # Shared across ALL tools on this server (sliding 1s window).
     requests-per-second: 100
+  audit:
+    # full = prompts/completions/tool args+results stored in the audit sinks (dev). redacted = SHA-256 + length only.
+    content: ${AUDIT_CONTENT:full}
+    jdbc:
+      enabled: ${AUDIT_JDBC_ENABLED:false}
+      url: ${AUDIT_JDBC_URL:jdbc:postgresql://localhost:5432/audit}
+      username: ${AUDIT_JDBC_USER:audit_writer}
+      password: ${AUDIT_JDBC_PASSWORD:audit_writer_dev}
 
 logging:
   level:
     com.milind.employeemcp: INFO
     org.springframework.ai: INFO
+
+# --- Telemetry (see ARCHITECTURE.md "Observability & Audit") -------------------------------------------
+management:
+  metrics:
+    distribution:
+      # Buckets are NOT published by default; without them histogram_quantile() (p50/p95 panels) returns NaN.
+      percentiles-histogram:
+        http.server.requests: true
+        gen_ai.client.operation: true
+        mcp.tool.call: true
+        spring.ai.tool: true
+      maximum-expected-value:
+        http.server.requests: 120s
+        gen_ai.client.operation: 120s
+        spring.ai.tool: 120s
+  tracing:
+    sampling:
+      probability: 1.0            # dev: keep everything. Prod: sample in the collector (tail sampling).
+  opentelemetry:
+    logging:
+      export:
+        otlp:
+          endpoint: ${OTLP_ENDPOINT:http://localhost:4318}/v1/logs
+    tracing:
+      export:
+        otlp:
+          endpoint: ${OTLP_ENDPOINT:http://localhost:4318}/v1/traces
+  otlp:
+    metrics:
+      export:
+        url: ${OTLP_ENDPOINT:http://localhost:4318}/v1/metrics
+        step: 10s
